@@ -1,0 +1,2 @@
+# [name] [key] [value]
+[legit server] [ssh legitServer@192.123.119.99 -p 7000] [foobarbaz]
