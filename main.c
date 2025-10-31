@@ -29,12 +29,25 @@ void fatal(char *format, ...)
         exit(EXIT_FAILURE);
 }
 
+bool is_flag(const char *arg)
+{
+        return strlen(arg) >= 2 && arg[0] == '-' && (arg[1] != ' ' && !(arg[1] >= '0' && arg[1] <= '9'));
+}
+
 long str_to_long(const char *s, int base)
 {
         char *endptr = NULL;
         long l = strtol(s, &endptr, base);
-        if (endptr == s || *endptr != '\0')
-                fatal("ERROR: str_to_long invalid string: %s, base: %d", s, base);
+        if (endptr == s || *endptr != '\0') {
+                if (base == 2)
+                        fatal("ERROR: invalid binary format: %s", s);
+                else if (base == 10)
+                        fatal("ERROR: invalid decimal format: %s", s);
+                else if (base == 16)
+                        fatal("ERROR: invalid hex format: %s", s);
+                else
+                        fatal("ERROR: not supported base: %d for %s", base, s);
+        }
         return l;
 }
 
@@ -197,8 +210,6 @@ struct Config {
 };
 
 struct App {
-        bool help_print;
-
         bool config_print;
         char *config_query_name;
 
@@ -210,9 +221,10 @@ struct App {
         char *db_query_line;
         char *db_query_time;
 
-        char *timestamp; // could be unix timestamp 1761272902 and formatted time "2025-09-12 12:30:21"
+        char *timestamp;            // could be unix timestamp 1761272902 and formatted time "2025-09-12 12:30:21"
         char *ssh_with_config_name; // ssh with config's name
         char *number;
+        char **calculator_args;     // use NULL termitor otherwise need to track it's length
 };
 
 struct Config *config_init()
@@ -231,7 +243,7 @@ struct Config *config_init()
                 int line_len;
                 if (line_end)
                         line_len = line_end - line_start;
-                else
+                else // last line
                         line_len = (char*)(config_txt + config_txt_len) - line_start;
                 char *line = calloc(1, line_len + 1);
                 if (line == NULL)
@@ -288,8 +300,10 @@ struct Config *config_init()
 
 void config_print(struct Config *config)
 {
-        if (config->len == 0)
+        if (config->len == 0) {
+                printf("ERROR: no config was found, should be installed with config.txt(format: [name] [key] [value]).\n");
                 return;
+        }
         size_t column_len[3] = {
                 strlen(config->items[0].name),
                 strlen(config->items[0].key),
@@ -371,14 +385,34 @@ struct App *app_init(int argc, char **argv)
         struct App *app = calloc(1, sizeof(*app));
         if (app == NULL)
                 fatal("ERROR: app_init app calloc fail");
+        // first loop search for help flag
+        for (int i = 1; i < argc; i++) {
+                if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+                        printf("OPTIONS:\n");
+                        printf("    -h,   --help,             show this help message\n");
+                        printf("    -c,   --config            show config, name-key-value format\n");
+                        printf("    -cv,  --config_vlaue      get config value by config name(-c to query)\n");
+                        printf("    -qb,  --query_batch       show query for batch\n");
+                        printf("    -ql,  --query_load        show query for load\n");
+                        printf("    -qss, --query_sniff_shake show query for sniff and shake\n");
+                        printf("    -qd,  --query_dump        show query for dump\n");
+                        printf("    -qw,  --query_wash        show qeury for wash\n");
+                        printf("    -qln, --query_line        1|2|3|4, default is 3\n");
+                        printf("    -qt,  --query_time        2025-09-12 12:30:21, default is now\n");
+                        printf("    -t,   --timestamp         1757651421 -> 2025-09-12 12:30:21, vice versa\n");
+                        printf("    -ssh, --ssh               ssh with config name(-c to query)\n");
+                        printf("    -n,   --number            decimal, binary(0b or 0B prefix), hex(0x or 0X prefix) transfer to one another\n");
+                        printf("    -C,   --calc              wrapper caulucator above bc, in zsh when use multiply('*') need to be quoted, so support replace 'x' for '*', 2x3 <==> 2*3 \n");
+                        exit(EXIT_SUCCESS);
+                }
+        }
+        // next loop do the init work
         int i = 1;
         while (i < argc) {
                 char *flag = argv[i++];
                 if (flag[0] != '-')
                         fatal("ERROR: invalid flag: %s", flag);
-                if (strcmp(flag, "-h") == 0 || strcmp(flag, "--help") == 0) {
-                        app->help_print = true;
-                } else if (strcmp(flag, "-c") == 0 || strcmp(flag, "--config") == 0) {
+                if (strcmp(flag, "-c") == 0 || strcmp(flag, "--config") == 0) {
                         app->config_print = true;
                 } else if (strcmp(flag, "-qb") == 0 || strcmp(flag, "--query_batch") == 0) {
                         app->db_print_batch = true;
@@ -390,6 +424,30 @@ struct App *app_init(int argc, char **argv)
                         app->db_print_dump = true;
                 } else if (strcmp(flag, "-qw") == 0 || strcmp(flag, "--query_wash") == 0) {
                         app->db_print_wash = true;
+                } else if (strcmp(flag, "-C") == 0 || strcmp(flag, "--calc") == 0) {
+                        if (i == argc)
+                                fatal("ERROR: flag(%s) not provide value", flag);
+                        char *first_arg = argv[i++];
+                        if (is_flag(first_arg))
+                                fatal("ERROR: flag(%s) not provide value", flag);
+                        char **calculator_args = calloc(1, sizeof(*calculator_args) * 128);
+                        if (!calculator_args)
+                                fatal("ERROR: app_init calculator_args calloc fail");
+                        int parameters_len = 0;
+                        calculator_args[parameters_len++] = strdup(first_arg);
+                        for (; i < argc && !is_flag(argv[i]); ++i) {
+                                calculator_args[parameters_len++] = strdup(argv[i]);
+                        }
+                        // support 'x' -> '*'
+                        for (int j = 0; j < parameters_len; ++j) {
+                                char *x = NULL;
+                                do {
+                                        x = strchr(calculator_args[j], 'x');
+                                        if (x != NULL)
+                                                *x = '*';
+                                } while (x != NULL);
+                        }
+                        app->calculator_args = calculator_args;
                 } else {
                         if (i == argc)
                                 fatal("ERROR: flag(%s) not provide value", flag);
@@ -421,23 +479,6 @@ struct App *app_init(int argc, char **argv)
 
 void app_run(struct App *app)
 {
-        if (app->help_print) {
-                printf("OPTIONS:\n");
-                printf("    -h,   --help,             show this help message\n");
-                printf("    -c,   --config            show config, name-key-value format\n");
-                printf("    -cv,  --config_vlaue      get config value by config name(-c to query)\n");
-                printf("    -qb,  --query_batch       show query for batch\n");
-                printf("    -ql,  --query_load        show query for load\n");
-                printf("    -qss, --query_sniff_shake show query for sniff and shake\n");
-                printf("    -qd,  --query_dump        show query for dump\n");
-                printf("    -qw,  --query_wash        show qeury for wash\n");
-                printf("    -qln, --query_line        1|2|3|4, default is 3\n");
-                printf("    -qt,  --query_time        2025-09-12 12:30:21, default is now\n");
-                printf("    -t,   --timestamp         1757651421 -> 2025-09-12 12:30:21, vice versa\n");
-                printf("    -ssh, --ssh               ssh with config name(-c to query)\n");
-                printf("    -n,   --number            decimal, binary(0b or 0B prefix), hex(0x or 0X prefix) transfer to one another\n");
-                return;
-        }
         if (app->config_print) {
                 struct Config *config = config_init();
                 config_print(config);
@@ -450,8 +491,17 @@ void app_run(struct App *app)
                         if (strcmp(app->config_query_name, config->items[i].name) == 0) {
                                 printf("%s\n", config->items[i].value);
                                 write_to_clipboard(config->items[i].value);
-                                break;
+                                return;
                         }
+                }
+                printf("ERROR: name '%s' not found in config.", app->config_query_name);
+                if (config->len > 0) {
+                        printf("\nExist config: ");
+                        for (int i = 0; i < config->len; ++i)
+                                printf("[%s]", config->items[i].name);
+                        putc('\n', stdout);
+                } else {
+                        printf(" No config was found, should be installed with config.txt\n");
                 }
                 return;
         }
@@ -559,6 +609,28 @@ void app_run(struct App *app)
                 }
                 return;
         }
+        if (app->calculator_args) {
+                size_t cmd_len = 16; // reserve length for bc <<< ""
+                for (int i = 0; app->calculator_args[i] != NULL; ++i)
+                        cmd_len += strlen(app->calculator_args[i]);
+                char *cmd = calloc(1, sizeof(*cmd) * cmd_len);
+                if (cmd == NULL)
+                        fatal("ERROR: app_run app->calculator_args cmd calloc fail");
+                strcat(cmd, "bc <<< \"");
+                for (int i = 0; app->calculator_args[i] != NULL; ++i)
+                        strcat(cmd, app->calculator_args[i]);
+                strcat(cmd, "\"");
+                FILE *pipe = popen(cmd, "r");
+                if (pipe == NULL)
+                        fatal("ERROR: app_run popen fail");
+                char buf[1024];
+                while (fgets(buf, sizeof(buf), pipe) != NULL) {
+                        printf(buf);
+                        buf[strlen(buf) - 1] = '\0'; // remove the new line character for clipboard
+                        write_to_clipboard(buf);
+                }
+                return;
+        }
         if (app->ssh_with_config_name) {
                 struct timeval start;
                 struct timeval end;
@@ -569,8 +641,19 @@ void app_run(struct App *app)
                                 break;
                 }
                 if (i == config->len) {
+                        printf("ERROR: can't find ssh config name %s. Exist ssh config: ", app->ssh_with_config_name);
+                        bool once = false;
+                        for (int i = 0; i < config->len; ++i) {
+                                if (strstr(config->items[i].key, "ssh") != NULL) {
+                                        once = true;
+                                        printf("[%s]", config->items[i].name);
+                                }
+                        }
+                        if (!once)
+                                printf("NULL.");
+                        putc('\n', stdout);
                         config_destroy(config);
-                        fatal("ERROR: can't find ssh config name %s", app->ssh_with_config_name);
+                        return;
                 }
                 int max_args = 128;
                 char **args = malloc(sizeof(*args) * (max_args + 2)); // 1 for ssh program and 1 for NULL terminator
@@ -620,11 +703,23 @@ void app_run(struct App *app)
 
 void app_destroy(struct App *app)
 {
-        if (app->config_query_name)    free(app->config_query_name);
-        if (app->db_query_line)        free(app->db_query_line);
-        if (app->db_query_time)        free(app->db_query_time);
-        if (app->timestamp)            free(app->timestamp);
-        if (app->ssh_with_config_name) free(app->ssh_with_config_name);
+        if (app->config_query_name)
+                free(app->config_query_name);
+        if (app->db_query_line)
+                free(app->db_query_line);
+        if (app->db_query_time)
+                free(app->db_query_time);
+        if (app->timestamp)
+                free(app->timestamp);
+        if (app->ssh_with_config_name)
+                free(app->ssh_with_config_name);
+        if (app->number)
+                free(app->number);
+        if (app->calculator_args) {
+                for (int i = 0; app->calculator_args[i] != NULL; ++i)
+                        free(app->calculator_args[i]);
+                free(app->calculator_args);
+        }
         free(app);
 }
 

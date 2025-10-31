@@ -9,9 +9,9 @@ static: check-xxd
 
 build: check-gcc static
 	@gcc -Wall -Wextra -pedantic -O3 -o kit main.c config.c
+	@rm config.c
 
 install: build
-	@rm config.c
 	@mv kit $(HOME)/bin
 	@echo "install kit to $(HOME)/bin/kit"
 
