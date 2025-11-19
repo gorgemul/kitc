@@ -10,6 +10,7 @@
 #include <sys/param.h> // MAX
 #include <sys/wait.h>
 #include <sys/time.h> // gettimeofday
+#include <errno.h>
 
 #define ANSI_COLOR_YELLOW     "\x1b[33m"
 #define ANSI_COLOR_RESET      "\x1b[0m"
@@ -32,6 +33,15 @@ void fatal(char *format, ...)
 bool is_flag(const char *arg)
 {
         return strlen(arg) >= 2 && arg[0] == '-' && (arg[1] != ' ' && !(arg[1] >= '0' && arg[1] <= '9'));
+}
+
+bool is_num_str(const char *str)
+{
+        for (size_t i = 0; i < strlen(str); ++i) {
+                if (str[i] < '0' || str[i] > '9')
+                        return false;
+        }
+        return true;
 }
 
 long str_to_long(const char *s, int base)
@@ -198,6 +208,29 @@ void print_n_char(char c, size_t n)
                 putc(c, stdout);
 }
 
+char *second_to_formattime(long second)
+{
+        char *buf = malloc(128);
+        if (buf == NULL)
+                fatal("ERROR: second_to_formattime buf malloc fail");
+        long h = second / 3600;
+        long m = (second / 60) % 60;
+        long s = second % 60;
+        if (h > 0) {
+                sprintf(buf, ANSI_COLOR_YELLOW "session last: %ld hours, %ld minutes, %ld seconds" ANSI_COLOR_RESET, h, m, s);
+        } else if (m > 0) {
+                sprintf(buf, ANSI_COLOR_YELLOW "session last: %ld minutes, %ld seconds" ANSI_COLOR_RESET, m, s);
+        } else {
+                sprintf(buf, ANSI_COLOR_YELLOW "session last: %ld seconds" ANSI_COLOR_RESET, s);
+        }
+        return buf;
+}
+
+struct ScpInfo {
+        char *port;
+        char *host;
+};
+
 struct ConfigItem {
         char *name;
         char *key;
@@ -225,7 +258,51 @@ struct App {
         char *ssh_with_config_name; // ssh with config's name
         char *number;
         char **calculator_args;     // use NULL termitor otherwise need to track it's length
+        char **scp_args;            // same as above
 };
+
+struct ScpInfo *scp_info_init(char *ssh_config_key)
+{
+        struct ScpInfo *si = calloc(1, sizeof(*si));
+        if (si == NULL)
+                fatal("ERROR: scp_info_init si calloc fail");
+        // since strtok munipulate original ssh_config_key, when print the error message with ssh_config_key, need to use this instead
+        char *log_str = strdup(ssh_config_key);
+        bool is_prev_port_flag = false;
+        for (char *token = strtok(ssh_config_key, " \t"); token != NULL; token = strtok(NULL, " \t")) {
+                if (strchr(token, '@') != NULL) {
+                        char *host = malloc(strlen(token) + 8);
+                        if (host == NULL)
+                                fatal("ERROR: scp_info_init host malloc fail");
+                        strcpy(host, token);
+                        strcat(host, ":~");
+                        si->host = host;
+                } else if (strcmp(token, "-p") == 0) {
+                        is_prev_port_flag = true;
+                } else if (si->port == NULL && is_prev_port_flag) {
+                        if (is_flag(token))
+                                fatal("ERROR: not provide value for scp port flag: %s", log_str);
+                        if (!is_num_str(token))
+                                fatal("ERROR: invalid format for scp port flag: %s", token);
+                        si->port = strdup(token);
+                }
+        }
+        if (si->host == NULL)
+                fatal("ERROR: could not find host in ssh config key: %s", log_str);
+        if (si->port == NULL)
+                si->port = strdup("22");
+        free(log_str);
+        return si;
+}
+
+void scp_info_destory(struct ScpInfo *si)
+{
+        if (si->host)
+                free(si->host);
+        if (si->port)
+                free(si->port);
+        free(si);
+}
 
 struct Config *config_init()
 {
@@ -390,8 +467,8 @@ struct App *app_init(int argc, char **argv)
                 if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
                         printf("OPTIONS:\n");
                         printf("    -h,   --help,             show this help message\n");
-                        printf("    -c,   --config            show config, name-key-value format\n");
-                        printf("    -cv,  --config_vlaue      get config value by config name(-c to query)\n");
+                        printf("    -c,   --config            show <exist_config_name>\n");
+                        printf("    -cv,  --config_vlaue      get config value by <exist_config_name>\n");
                         printf("    -qb,  --query_batch       show query for batch\n");
                         printf("    -ql,  --query_load        show query for load\n");
                         printf("    -qss, --query_sniff_shake show query for sniff and shake\n");
@@ -400,9 +477,10 @@ struct App *app_init(int argc, char **argv)
                         printf("    -qln, --query_line        1|2|3|4, default is 3\n");
                         printf("    -qt,  --query_time        2025-09-12 12:30:21, default is now\n");
                         printf("    -t,   --timestamp         1757651421 -> 2025-09-12 12:30:21, vice versa\n");
-                        printf("    -ssh, --ssh               ssh with config name(-c to query)\n");
                         printf("    -n,   --number            decimal, binary(0b or 0B prefix), hex(0x or 0X prefix) transfer to one another\n");
                         printf("    -C,   --calc              wrapper caulucator above bc, in zsh when use multiply('*') need to be quoted, so support replace 'x' for '*', 2x3 <==> 2*3 \n");
+                        printf("    -ssh, --ssh               kit -ssh <exist_config_name>\n");
+                        printf("    -scp, --scp               kit -scp <foo_dir> <bar_dir> <exist_config_name>\n");
                         exit(EXIT_SUCCESS);
                 }
         }
@@ -433,13 +511,13 @@ struct App *app_init(int argc, char **argv)
                         char **calculator_args = calloc(1, sizeof(*calculator_args) * 128);
                         if (!calculator_args)
                                 fatal("ERROR: app_init calculator_args calloc fail");
-                        int parameters_len = 0;
-                        calculator_args[parameters_len++] = strdup(first_arg);
+                        int len = 0;
+                        calculator_args[len++] = strdup(first_arg);
                         for (; i < argc && !is_flag(argv[i]); ++i) {
-                                calculator_args[parameters_len++] = strdup(argv[i]);
+                                calculator_args[len++] = strdup(argv[i]);
                         }
                         // support 'x' -> '*'
-                        for (int j = 0; j < parameters_len; ++j) {
+                        for (int j = 0; j < len; ++j) {
                                 char *x = NULL;
                                 do {
                                         x = strchr(calculator_args[j], 'x');
@@ -448,6 +526,21 @@ struct App *app_init(int argc, char **argv)
                                 } while (x != NULL);
                         }
                         app->calculator_args = calculator_args;
+                } else if (strcmp(flag, "-scp") == 0 || strcmp(flag, "--scp") == 0) {
+                        if (i == argc)
+                                fatal("ERROR: flag(%s) not provide value", flag);
+                        char *first_arg = argv[i++];
+                        if (is_flag(first_arg))
+                                fatal("ERROR: flag(%s) not provide value", flag);
+                        char **scp_args = calloc(1, sizeof(*scp_args) * 128);
+                        if (!scp_args)
+                                fatal("ERROR: app_init scp_args calloc fail");
+                        int len = 0;
+                        scp_args[len++] = strdup(first_arg);
+                        for (; i < argc && !is_flag(argv[i]); ++i) {
+                                scp_args[len++] = strdup(argv[i]);
+                        }
+                        app->scp_args = scp_args;
                 } else {
                         if (i == argc)
                                 fatal("ERROR: flag(%s) not provide value", flag);
@@ -631,6 +724,70 @@ void app_run(struct App *app)
                 }
                 return;
         }
+        if (app->scp_args) {
+                struct Config *config = config_init();
+                int len = 0;
+                while (app->scp_args[len] != NULL) {
+                     len++;
+                }
+                if (len > 121)
+                        fatal("ERROR: too many argument in scp, only support upload up to 120 files");
+                int i = 0;
+                for (; i < config->len; i++) {
+                        if (strcmp(app->scp_args[len-1], config->items[i].name) == 0)
+                                break;
+                }
+                if (i == config->len) {
+                        printf("ERROR: can't find scp config name %s. Exist ssh config: ", app->scp_args[len-1]);
+                        bool once = false;
+                        for (int i = 0; i < config->len; ++i) {
+                                if (strstr(config->items[i].key, "ssh") != NULL) {
+                                        once = true;
+                                        printf("[%s]", config->items[i].name);
+                                }
+                        }
+                        if (!once)
+                                printf("NULL.");
+                        putc('\n', stdout);
+                        config_destroy(config);
+                        return;
+                }
+                struct timeval start;
+                struct timeval end;
+                int max_args = 128;
+                char **args = malloc(sizeof(*args) * (max_args+2)); // 1 for scp program and 1 for NULL terminator
+                if (!args) {
+                        config_destroy(config);
+                        fatal("ERROR: app_run scp args malloc fail");
+                }
+                struct ScpInfo *si = scp_info_init(config->items[i].key);
+                int args_len = 0;
+                args[args_len++] = strdup("scp");
+                args[args_len++] = strdup("-P");
+                args[args_len++] = strdup(si->port);
+                args[args_len++] = strdup("-r");
+                for (int i = 0; i < len - 1; ++i) {
+                        args[args_len++] = app->scp_args[i];
+                }
+                args[args_len++] = strdup(si->host);
+                scp_info_destory(si);
+                args[args_len++] = NULL;
+                write_to_clipboard(config->items[i].value);
+                gettimeofday(&start, NULL);
+                int rc = fork();
+                if (rc == -1)
+                        fatal("ERROR: app_run scp fork fail");
+                if (rc == 0) {
+                        execvp("scp", args);
+                        fatal("ERROR: scp fail: %s", strerror(errno));
+                }
+                wait(NULL);
+                gettimeofday(&end, NULL);
+                char *formattime = second_to_formattime(end.tv_sec - start.tv_sec);
+                printf("%s\n", formattime);
+                free(formattime);
+                return;
+        }
         if (app->ssh_with_config_name) {
                 struct timeval start;
                 struct timeval end;
@@ -659,7 +816,7 @@ void app_run(struct App *app)
                 char **args = malloc(sizeof(*args) * (max_args + 2)); // 1 for ssh program and 1 for NULL terminator
                 if (!args) {
                         config_destroy(config);
-                        fatal("ERROR: app_run args malloc fail");
+                        fatal("ERROR: app_run ssh args malloc fail");
                 }
                 args[0] = strdup("ssh");
                 int index = 1;
@@ -677,26 +834,16 @@ void app_run(struct App *app)
                 gettimeofday(&start, NULL);
                 int rc = fork();
                 if (rc == -1)
-                        fatal("ERROR: app_run fork fail");
+                        fatal("ERROR: app_run ssh fork fail");
                 if (rc == 0) {
                         execvp("ssh", args);
-                        fatal("ERROR: app_run execvp should never return");
+                        fatal("ERROR: ssh fail: %s", strerror(errno));
                 }
                 wait(NULL);
                 gettimeofday(&end, NULL);
-                long second_diff = end.tv_sec - start.tv_sec;
-                long hour = second_diff / 3600;
-                long minute = second_diff / 60;
-                long second = second_diff % 60;
-                char buf[128];
-                if (hour > 0) {
-                        sprintf(buf, ANSI_COLOR_YELLOW "session last: %ld hours, %ld minutes, %ld seconds" ANSI_COLOR_RESET, hour, minute, second);
-                } else if (minute > 0) {
-                        sprintf(buf, ANSI_COLOR_YELLOW "session last: %ld minutes, %ld seconds" ANSI_COLOR_RESET, minute, second);
-                } else {
-                        sprintf(buf, ANSI_COLOR_YELLOW "session last: %ld seconds" ANSI_COLOR_RESET, second);
-                }
-                printf("%s\n", buf);
+                char *formattime = second_to_formattime(end.tv_sec - start.tv_sec);
+                printf("%s\n", formattime);
+                free(formattime);
                 return;
         }
 }
